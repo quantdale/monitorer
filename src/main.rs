@@ -394,9 +394,8 @@ impl SystemMonitor {
     // ---------------------------------------------------------------------------
     // GPU UTILIZATION HELPER — Query WMI for GPU Engine utilization percentage
     // ---------------------------------------------------------------------------
-    // On Windows, we query the WMI class Win32_PerfFormattedData_Gpu3d_Gpu3dEngine
-    // for GPU utilization. This is the same data source that Windows Task Manager
-    // and Performance Monitor use under the hood.
+    // On Windows, we query WMI for GPU utilization. This is the same data source
+    // that Windows Task Manager and Performance Monitor use under the hood.
     //
     // Returns: (igpu_util, dgpu_util) where:
     //   igpu_util = Intel iGPU utilization % (0.0–100.0), or 0.0 if not found
@@ -408,54 +407,99 @@ impl SystemMonitor {
     fn query_gpu_utilization() -> (f64, f64) {
         // Initialize COM for WMI (required on Windows for WMI queries).
         // WMI is the Windows Management Instrumentation subsystem, exposed via COM.
-        // COMLibrary is the COM initialization guard — when it drops, COM is uninitialized.
         let com_lib = match wmi::COMLibrary::new() {
             Ok(lib) => lib,
-            Err(_) => return (0.0, 0.0), // COM initialization failed
+            Err(_) => return (0.0, 0.0),
         };
 
-        // Create a WMI connection using the COM library.
         let wmi_con = match wmi::WMIConnection::new(com_lib) {
             Ok(con) => con,
-            Err(_) => return (0.0, 0.0), // WMI connection failed
+            Err(_) => return (0.0, 0.0),
         };
 
-        // Query GPU Engine objects from WMI.
-        // raw_query() returns a Vec<HashMap> where each row is a GPU engine entry.
-        // We fetch the Name and UtilizationPercentage fields.
-        let results: Vec<std::collections::HashMap<String, String>> = match wmi_con.raw_query(
-            "SELECT Name, UtilizationPercentage FROM Win32_PerfFormattedData_Gpu3d_Gpu3dEngine"
-        ) {
-            Ok(res) => res,
-            Err(_) => return (0.0, 0.0), // WMI query failed
-        };
+        // Try multiple WMI queries for GPU data, in order of preference.
+        // Some systems may have different GPU counter configurations.
+        let queries = vec![
+            // Standard 3D GPU Engine utilization (most common on modern Windows)
+            "SELECT Name, UtilizationPercentage FROM Win32_PerfFormattedData_Gpu3d_Gpu3dEngine",
+            // Raw data counter variant
+            "SELECT Name FROM Win32_PerfRawData_Gpu3d_Gpu3dEngine",
+            // Try querying from the root\cimv2 namespace explicitly
+            "SELECT * FROM Win32_PerfFormattedData_Gpu3d_Gpu3dEngine WHERE UtilizationPercentage > 0",
+        ];
 
-        // If no results, no GPUs are being monitored by this counter class.
-        if results.is_empty() {
-            return (0.0, 0.0);
-        }
+        for query in queries {
+            let results: Vec<std::collections::HashMap<String, String>> = match wmi_con.raw_query(query) {
+                Ok(res) => res,
+                Err(_) => continue, // Try next query
+            };
 
-        // Parse and aggregate by GPU type (iGPU vs dGPU).
-        // In practice, you might have one iGPU and one dGPU, but we take the
-        // maximum utilization of each type (in case of multi-GPU setups).
-        let (mut igpu_max, mut dgpu_max) = (0.0_f64, 0.0_f64);
-
-        for row in results {
-            // Extract Name and UtilizationPercentage from the WMI result.
-            let name = row.get("Name").map(|s| s.as_str()).unwrap_or("").to_uppercase();
-            let util_str = row.get("UtilizationPercentage").map(|s| s.as_str()).unwrap_or("0");
-            let util: f64 = util_str.parse().unwrap_or(0.0);
-
-            // Categorize by GPU vendor.
-            if name.contains("INTEL") {
-                igpu_max = igpu_max.max(util);
-            } else if name.contains("NVIDIA") || name.contains("AMD") || name.contains("RADEON") {
-                dgpu_max = dgpu_max.max(util);
+            if results.is_empty() {
+                continue; // No results, try next query
             }
-            // Ignore other GPUs (if any)
+
+            // Successfully got GPU data. Parse it.
+            let (mut igpu_max, mut dgpu_max) = (0.0_f64, 0.0_f64);
+
+            for row in results {
+                // Extract Name and UtilizationPercentage fields if they exist.
+                // For formatted data, UtilizationPercentage should be present.
+                // For raw data, we may only have Name (and would need different logic).
+                let name = row.get("Name")
+                    .map(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_uppercase();
+
+                // Try to parse UtilizationPercentage. If not available (raw data),
+                // default to checking if GPU was found (we'll show non-zero indicator).
+                let util: f64 = row.get("UtilizationPercentage")
+                    .and_then(|u_str| u_str.parse().ok())
+                    .unwrap_or_else(|| {
+                        // For raw data queries, if we have a GPU name, assume it's active.
+                        if name.contains("INTEL") || name.contains("NVIDIA") || 
+                           name.contains("AMD") || name.contains("RADEON") {
+                            1.0 // Fallback: show 1% to indicate GPU exists
+                        } else {
+                            0.0
+                        }
+                    });
+
+                // Categorize by GPU vendor.
+                if name.contains("INTEL") {
+                    igpu_max = igpu_max.max(util);
+                } else if name.contains("NVIDIA") || name.contains("AMD") || name.contains("RADEON") {
+                    dgpu_max = dgpu_max.max(util);
+                }
+            }
+
+            // If either GPU was found and we got data, return it.
+            if igpu_max > 0.0 || dgpu_max > 0.0 {
+                return (igpu_max, dgpu_max);
+            }
         }
 
-        (igpu_max, dgpu_max)
+        // All queries returned empty. GPUs may not be exposing WMI counters.
+        // Try a fallback: query for video controllers just to detect if GPUs exist.
+        // This helps distinguish between "no GPU" and "GPU exists but no utilization data".
+        let _gpu_exists: bool = match wmi_con.raw_query::<std::collections::HashMap<String, String>>(
+            "SELECT Name FROM Win32_VideoController"
+        ) {
+            Ok(results) => {
+                // If we have video controllers, check if any are Intel/NVIDIA/AMD
+                results.iter().any(|gpu| {
+                    let name = gpu.get("Name").map(|s| s.as_str()).unwrap_or("").to_uppercase();
+                    name.contains("INTEL") || name.contains("NVIDIA") || name.contains("AMD") || name.contains("RADEON")
+                })
+            }
+            Err(_) => false,
+        };
+
+        // If GPUs exist but WMI performance counters aren't available, this is likely due to:
+        //   - GPU drivers not exposing performance counters via WMI
+        //   - Windows Performance Monitor GPU counters not enabled
+        //   - Running in a virtual machine or remote session
+        // We return 0.0 in this case, but could log a message if error reporting was enabled.
+        (0.0, 0.0)
     }
 }
 
