@@ -49,6 +49,14 @@ use sysinfo::System;                     // Wraps Windows system APIs
 // Under the hood on Windows this calls DeviceIoControl with IOCTL_DISK_PERFORMANCE
 // to read per-disk I/O counters — the same source Task Manager uses.
 use sysinfo::Disks;
+// Networks is sysinfo's handle for querying network interface statistics.
+// Under the hood on Windows, sysinfo calls GetIfTable2() / GetIfEntry2()
+// from the IP Helper API (iphlpapi.dll) — the same source as Resource Monitor.
+// It exposes per-interface counters that update every time you call refresh().
+// Unlike the disk API (which returns cumulative bytes-since-boot), the
+// Networks API returns the DELTA bytes since the LAST refresh(), so we don't
+// need to manually subtract a previous snapshot — sysinfo does it for us.
+use sysinfo::Networks;
 
 // ---------------------------------------------------------------------------
 // WHAT IS A VecDeque?
@@ -136,6 +144,20 @@ struct SystemMonitor {
     disk_c_prev_write: u64,
     disk_d_prev_read:  u64,
     disk_d_prev_write: u64,
+
+    // ── NETWORK I/O ──────────────────────────────────────────────────────────
+    // Networks is a HashMap<String, NetworkData> under the hood — each key is
+    // the OS-assigned interface name (e.g. "Ethernet", "Wi-Fi", "vEthernet").
+    // We keep one handle and call refresh() on it every second.
+    networks: Networks,
+
+    // Combined download (received) and upload (transmitted) rate across all
+    // non-loopback interfaces, stored in KB/s.
+    // Aggregating all adapters matches Task Manager's "Total" network view.
+    // We use KB/s rather than MB/s for network because most traffic is in the
+    // tens-of-KB/s range; MB/s would make the graph flat most of the time.
+    net_recv_history: VecDeque<f64>, // download KB/s history
+    net_sent_history: VecDeque<f64>, // upload   KB/s history
 }
 
 impl SystemMonitor {
@@ -174,6 +196,15 @@ impl SystemMonitor {
         // on the first 1-second tick is meaningful rather than equal to bytes-since-boot.
         let (c_r0, c_w0, d_r0, d_w0) = Self::sample_disk_bytes(&disks);
 
+        // Initialise the Networks handle.
+        // new_with_refreshed_list() calls GetIfTable2() immediately to discover all
+        // interfaces and seed the internal counters, so the first refresh() call
+        // will already produce a valid delta (not bytes-since-boot).
+        let mut networks = Networks::new_with_refreshed_list();
+        // A second refresh seeds the per-interface delta counters so the first
+        // reading we display is sensible rather than a large spike from boot stats.
+        networks.refresh(false);
+
         SystemMonitor {
             system,
             cpu_history: VecDeque::with_capacity(60), // pre-allocate for 60 items
@@ -192,6 +223,9 @@ impl SystemMonitor {
             disk_c_prev_write: c_w0,
             disk_d_prev_read:  d_r0,
             disk_d_prev_write: d_w0,
+            networks,
+            net_recv_history: VecDeque::with_capacity(60),
+            net_sent_history: VecDeque::with_capacity(60),
         }
     }
 
@@ -290,6 +324,41 @@ impl SystemMonitor {
         Self::push_history(&mut self.disk_c_write_history, c_write_mbs, self.history_length);
         Self::push_history(&mut self.disk_d_read_history,  d_read_mbs,  self.history_length);
         Self::push_history(&mut self.disk_d_write_history, d_write_mbs, self.history_length);
+
+        // ── NETWORK I/O REFRESH ─────────────────────────────────────────────
+        // networks.refresh(false) calls GetIfEntry2() for each interface.
+        // After this call, received() and transmitted() on each NetworkData
+        // return the bytes transferred since the PREVIOUS refresh() — i.e. the
+        // delta is pre-computed by sysinfo. At 1 Hz polling, delta == bytes/sec.
+        self.networks.refresh(false);
+
+        // Accumulate bytes across all interfaces, skipping:
+        //   - Loopback ("lo" on Linux, "Loopback*" on Windows) — localhost traffic
+        //     would massively inflate the reading with no useful signal.
+        //   - Interfaces with zero traffic this tick — doesn't change the sum but
+        //     avoids counting inactive virtual adapters (e.g. VirtualBox, WSL).
+        //
+        // "Loopback" check: Windows names loopback as "Loopback Pseudo-Interface N"
+        // and Linux as "lo". We filter both with a case-insensitive prefix check.
+        let mut total_recv_bytes = 0u64;
+        let mut total_sent_bytes = 0u64;
+        for (iface_name, data) in &self.networks {
+            let name_upper = iface_name.to_uppercase();
+            if name_upper.contains("LOOPBACK") || name_upper == "LO" {
+                continue; // skip loopback
+            }
+            total_recv_bytes += data.received();
+            total_sent_bytes += data.transmitted();
+        }
+
+        // Convert bytes/sec → KB/s (divide by 1024).
+        // We use KB/s for network because typical usage (streaming, browsing)
+        // sits in the 100–10 000 KB/s range — MB/s would make the graph too flat.
+        let recv_kbs = total_recv_bytes as f64 / 1024.0;
+        let sent_kbs = total_sent_bytes as f64 / 1024.0;
+
+        Self::push_history(&mut self.net_recv_history, recv_kbs, self.history_length);
+        Self::push_history(&mut self.net_sent_history, sent_kbs, self.history_length);
     }
 
     // Small reusable helper: push a value onto a VecDeque and pop the oldest
@@ -643,6 +712,90 @@ impl eframe::App for SystemMonitor {
                 .show(ui, |plot_ui| {
                     plot_ui.line(d_read_line);
                     plot_ui.line(d_write_line);
+                });
+
+            ui.add_space(16.0);
+            ui.separator();
+            ui.add_space(16.0);
+
+            // ── NETWORK SECTION ───────────────────────────────────────────────
+            // Shows combined download + upload rates across ALL non-loopback
+            // network adapters (Ethernet + Wi-Fi + VPN, etc. summed together).
+            //
+            // Two lines on one graph:
+            //   cyan  = download (received, data coming IN from the internet)
+            //   pink  = upload   (transmitted, data going OUT to the internet)
+            //
+            // Y-axis is auto-scaling in KB/s so it adapts from idle (near 0)
+            // to heavy load (10 000+ KB/s for a 100 Mbps stream).
+            // include_y(10.0) sets a reasonable minimum scale so the graph never
+            // collapses to a completely flat line during idle periods.
+            ui.heading(
+                egui::RichText::new("Network  —  Total (all adapters)")
+                    .size(16.0)
+                    .color(Color32::from_rgb(80, 220, 240)), // cyan
+            );
+            ui.add_space(4.0);
+
+            let net_recv_now = *self.net_recv_history.back().unwrap_or(&0.0);
+            let net_sent_now = *self.net_sent_history.back().unwrap_or(&0.0);
+
+            // Format helper: display as KB/s below 1 MB/s threshold, MB/s above.
+            // This mirrors how Task Manager switches units dynamically.
+            let fmt_net = |kbs: f64| -> String {
+                if kbs >= 1024.0 {
+                    format!("{:.2} MB/s", kbs / 1024.0)
+                } else {
+                    format!("{:.1} KB/s", kbs)
+                }
+            };
+
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(format!("\u{25bc} Download: {}", fmt_net(net_recv_now)))
+                        .size(18.0)
+                        .color(Color32::from_rgb(80, 220, 240)), // cyan
+                );
+                ui.add_space(24.0);
+                ui.label(
+                    egui::RichText::new(format!("\u{25b2} Upload:   {}", fmt_net(net_sent_now)))
+                        .size(18.0)
+                        .color(Color32::from_rgb(240, 130, 200)), // pink
+                );
+            });
+            ui.add_space(6.0);
+
+            let net_recv_pts: PlotPoints = self.net_recv_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+            let net_sent_pts: PlotPoints = self.net_sent_history
+                .iter().enumerate()
+                .map(|(i, &v)| [i as f64, v])
+                .collect();
+
+            let net_recv_line = Line::new(net_recv_pts)
+                .color(Color32::from_rgb(80, 220, 240))  // cyan
+                .width(2.0)
+                .name("Download");
+            let net_sent_line = Line::new(net_sent_pts)
+                .color(Color32::from_rgb(240, 130, 200)) // pink
+                .width(2.0)
+                .name("Upload");
+
+            // Y-axis label adapts to units: since we plot raw KB/s values,
+            // we always label it KB/s for consistency with the data range.
+            Plot::new("net_plot")
+                .height(130.0)
+                .include_y(0.0)
+                .include_y(10.0)  // show at least 0–10 KB/s so the graph is never flat
+                .y_axis_label("KB/s")
+                .allow_zoom(false)
+                .allow_drag(false)
+                .set_margin_fraction(egui::Vec2::new(0.0, 0.05))
+                .show(ui, |plot_ui| {
+                    plot_ui.line(net_recv_line);
+                    plot_ui.line(net_sent_line);
                 });
 
             ui.add_space(8.0);
