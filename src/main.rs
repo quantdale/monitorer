@@ -115,7 +115,7 @@ struct SystemMonitor {
     last_update: Instant,
 
     // Number of data points to display in the current time window.
-    // Dynamically set by the time range selector (30, 60, 300, 600, 1800, 3600).
+    // Dynamically set by the time range dropdown selector.
     history_length: usize,
 
     // The maximum capacity of the history buffer — always 3600 (one data point
@@ -126,9 +126,24 @@ struct SystemMonitor {
     // display window size, switching to a longer range would show gaps.
     max_history: usize,
 
-    // The currently selected duration in seconds, controlled by the header
-    // buttons (30, 60, 300, 600, 1800, 3600). Default: 60 (1 minute).
-    selected_duration: u64,
+    // The currently selected duration in seconds (30, 60, 300, 600, 1800, 3600).
+    // Controlled by the time range dropdown. Stored as u64 to match duration constants.
+    selected_duration_secs: u64,
+
+    // The human-readable label for the selected time range (e.g. "Last 1 minute").
+    // We store this separately so egui's ComboBox widget has easy display state.
+    selected_duration_label: String,
+
+    // The current polling interval in milliseconds (1000, 500, 250).
+    // Controls how frequently we call sysinfo to refresh metrics.
+    // Windows PDH (the CPU counter API) has a ~250ms minimum meaningful update rate,
+    // so values below that will see repeated CPU readings at times. Memory and disk
+    // counters refresh faster than CPU at the OS level.
+    poll_interval_ms: u64,
+
+    // The human-readable label for the selected polling rate (e.g. "1 second", "500ms").
+    // We store this separately so egui's ComboBox widget has easy display state.
+    selected_poll_label: String,
 
     // ── DISK I/O ────────────────────────────────────────────────────────────
     // sysinfo::Disks is a dedicated handle for querying disk statistics.
@@ -241,9 +256,12 @@ impl SystemMonitor {
             // the very first frame immediately triggers a data refresh instead of
             // waiting one second for the first reading.
             last_update: Instant::now() - Duration::from_secs(1),
-            history_length: 60,       // default display window: 1 minute
-            max_history: 3600,        // buffer cap: 1 hour (3600 seconds)
-            selected_duration: 60,    // default selected time range: 1 minute
+            history_length: 60,                             // default display window: 1 minute
+            max_history: 3600,                              // buffer cap: 1 hour (3600 seconds)
+            selected_duration_secs: 60,                     // default selected time range: 1 minute
+            selected_duration_label: "Last 1 minute".to_string(),
+            poll_interval_ms: 1000,                         // default polling rate: 1 second
+            selected_poll_label: "1 second".to_string(),
             disks,
             disk_c_read_history:  VecDeque::with_capacity(3600),
             disk_c_write_history: VecDeque::with_capacity(3600),
@@ -580,19 +598,26 @@ impl eframe::App for SystemMonitor {
     //   - The loop runs at 60fps, not 1s, but we throttle the metric polling to 1s.
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // ---------------------------------------------------------------------------
-        // STEP 1: THROTTLE METRIC UPDATES TO 1 Hz (once per second)
+        // STEP 1: THROTTLE METRIC UPDATES TO THE SELECTED POLLING INTERVAL
         // ---------------------------------------------------------------------------
-        // egui calls update() ~60 times/second. We don't need to poll the OS
-        // every frame — that wastes CPU and the data doesn't change that fast anyway.
+        // egui calls update() ~60 times/second. We throttle metric polling to the
+        // user's selected interval: 1000ms (default), 500ms, or 250ms.
         //
-        // Instant::elapsed() returns how much time has passed since last_update.
-        // Duration::from_secs(1) is the threshold — 1 second.
+        // Duration::from_millis() converts the user's selected poll_interval_ms
+        // into a Duration. Instant::elapsed() returns how much time has passed
+        // since last_update. When elapsed >= poll_duration, we refresh metrics.
         //
-        // Web analogy: think of this as a debounce/throttle guard:
-        //   if (Date.now() - lastUpdate > 1000) { fetchMetrics(); lastUpdate = Date.now(); }
-        if self.last_update.elapsed() >= Duration::from_secs(1) {
+        // At 250ms polling: 60 seconds of history = ~240 data points (not 60).
+        // At 500ms polling: 60 seconds of history = ~120 data points.
+        // At 1000ms polling: 60 seconds of history = 60 data points (the original).
+        //
+        // Each point's X coordinate (elapsed time) must account for the actual
+        // interval between points, so the X axis always represents real elapsed
+        // seconds, not just point count.
+        let poll_duration = Duration::from_millis(self.poll_interval_ms);
+        if self.last_update.elapsed() >= poll_duration {
             self.refresh_metrics();
-            self.last_update = Instant::now(); // reset the clock
+            self.last_update = Instant::now();
         }
 
         // ---------------------------------------------------------------------------
@@ -633,41 +658,76 @@ impl eframe::App for SystemMonitor {
             // Add some breathing room around all content, like CSS padding.
             ui.add_space(8.0);
 
-            // ── TIME RANGE SELECTOR ──────────────────────────────────────────
-            // Display a row of selectable buttons that control how many seconds
-            // of history all graphs display. Only one can be active at a time
-            // (radio-button behaviour).
-            //
-            // egui's selectable_value() works like a radio button group:
-            //   ui.selectable_value(&mut state_var, candidate_value, label)
-            //   • If state_var == candidate_value → renders with a filled/highlighted
-            //     background (the "selected" look).
-            //   • If state_var != candidate_value → renders with a subtle outline
-            //     (the "unselected" look).
-            //   • On click → sets state_var = candidate_value automatically.
-            // Because all buttons share the same &mut variable (selected_duration),
-            // selecting one deselects the others — exactly like HTML radio inputs.
+            // ── UI SELECTORS (Header) ────────────────────────────────────────
+            // Display selectors for time range and polling rate side-by-side.
             ui.horizontal(|ui| {
                 ui.label(
                     egui::RichText::new("Time Range:")
                         .size(14.0)
                         .color(Color32::from_rgb(180, 180, 180)),
                 );
-                for &(label, duration) in &[
-                    ("30s", 30u64), ("1m", 60), ("5m", 300),
-                    ("10m", 600), ("30m", 1800), ("1h", 3600),
-                ] {
-                    ui.selectable_value(&mut self.selected_duration, duration, label);
-                }
+                // egui widget IDs must be globally unique within the UI tree each frame.
+                // from_id_source("...") sets an explicit ID rather than deriving it from
+                // the label text — safer because two widgets with the same label (or both
+                // using from_label("")) would hash to the same ID and clash at runtime.
+                // This is the same concept as the `key` prop in React lists.
+                egui::ComboBox::from_id_source("time_range_dropdown")
+                    .selected_text(&self.selected_duration_label)
+                    .show_ui(ui, |ui| {
+                        let options = vec![
+                            ("Last 30 seconds", 30u64),
+                            ("Last 1 minute", 60),
+                            ("Last 5 minutes", 300),
+                            ("Last 10 minutes", 600),
+                            ("Last 30 minutes", 1800),
+                            ("Last 1 hour", 3600),
+                        ];
+                        for (label, secs) in options {
+                            if ui.selectable_value(&mut self.selected_duration_secs, secs, label).changed() {
+                                self.selected_duration_label = label.to_string();
+                            }
+                        }
+                    });
+                
+                ui.add_space(40.0);
+                
+                ui.label(
+                    egui::RichText::new("Polling Rate:")
+                        .size(14.0)
+                        .color(Color32::from_rgb(180, 180, 180)),
+                );
+                // Unique ID avoids clashing with time_range_dropdown above.
+                egui::ComboBox::from_id_source("poll_rate_dropdown")
+                    .selected_text(&self.selected_poll_label)
+                    .show_ui(ui, |ui| {
+                        let options = vec![
+                            ("1 second (1000ms)", 1000u64),
+                            ("500ms", 500u64),
+                            ("250ms", 250u64),
+                        ];
+                        for (label, ms) in options {
+                            if ui.selectable_value(&mut self.poll_interval_ms, ms, label).changed() {
+                                self.selected_poll_label = label.to_string();
+                            }
+                        }
+                    });
             });
+
+            ui.add_space(12.0);
+
+            ui.label(
+                egui::RichText::new("⚠ Below 1s: Windows API limits may cause CPU values to not change every poll")
+                    .size(12.0)
+                    .color(Color32::from_rgb(255, 200, 100)),
+            );
 
             // Sync the display window size with the (possibly just-changed)
             // selected duration. This runs every frame so graphs immediately
             // reflect any change from the buttons above.
-            self.history_length = self.selected_duration as usize;
+            self.history_length = self.selected_duration_secs as usize;
 
             // Human-readable X axis label reflecting the selected time range.
-            let x_label = match self.selected_duration {
+            let x_label = match self.selected_duration_secs {
                 30   => "Last 30 seconds",
                 60   => "Last 1 minute",
                 300  => "Last 5 minutes",
@@ -707,14 +767,21 @@ impl eframe::App for SystemMonitor {
                 // only the most recent `window` data points. After skip, enumerate()
                 // produces 0-based X coordinates: x=0 is the oldest visible point,
                 // x=window−1 is the newest.
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.cpu_history.len());
                 let skip = self.cpu_history.len() - window;
+                // X coordinate: oldest point at x=0 (left), newest at x=window_secs (right).
+                // Time flows left → right with positive increasing values.
+                // No .rev() needed — iter() already goes oldest→newest (VecDeque front→back).
                 let cpu_points: PlotPoints = self
                     .cpu_history
                     .iter()
                     .skip(skip)
                     .enumerate()
-                    .map(|(i, &val)| [i as f64, val])
+                    .map(|(i, &val)| {
+                        let age_secs = i as f64 * poll_interval_secs;
+                        [age_secs, val]
+                    })
                     .collect();
 
                 let cpu_line = Line::new(cpu_points)
@@ -757,7 +824,7 @@ impl eframe::App for SystemMonitor {
                 );
                 ui.add_space(6.0);
 
-                // Slice the last `history_length` points from the buffer for display.
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.mem_history.len());
                 let skip = self.mem_history.len() - window;
                 let mem_points: PlotPoints = self
@@ -765,7 +832,10 @@ impl eframe::App for SystemMonitor {
                     .iter()
                     .skip(skip)
                     .enumerate()
-                    .map(|(i, &val)| [i as f64, val])
+                    .map(|(i, &val)| {
+                        let age_secs = i as f64 * poll_interval_secs;
+                        [age_secs, val]
+                    })
                     .collect();
 
                 let mem_line = Line::new(mem_points)
@@ -817,17 +887,17 @@ impl eframe::App for SystemMonitor {
                 });
                 ui.add_space(6.0);
 
-                // Slice the last `history_length` points for display.
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.disk_c_read_history.len());
                 let skip_r = self.disk_c_read_history.len() - window;
                 let c_read_pts: PlotPoints = self.disk_c_read_history
                     .iter().skip(skip_r).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
                 let skip_w = self.disk_c_write_history.len().saturating_sub(window);
                 let c_write_pts: PlotPoints = self.disk_c_write_history
                     .iter().skip(skip_w).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
 
                 let c_read_line  = Line::new(c_read_pts)
@@ -883,16 +953,17 @@ impl eframe::App for SystemMonitor {
                 });
                 ui.add_space(6.0);
 
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.disk_d_read_history.len());
                 let skip_r = self.disk_d_read_history.len() - window;
                 let d_read_pts: PlotPoints = self.disk_d_read_history
                     .iter().skip(skip_r).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
                 let skip_w = self.disk_d_write_history.len().saturating_sub(window);
                 let d_write_pts: PlotPoints = self.disk_d_write_history
                     .iter().skip(skip_w).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
 
                 let d_read_line  = Line::new(d_read_pts)
@@ -956,16 +1027,17 @@ impl eframe::App for SystemMonitor {
                 });
                 ui.add_space(6.0);
 
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.net_recv_history.len());
                 let skip_r = self.net_recv_history.len() - window;
                 let net_recv_pts: PlotPoints = self.net_recv_history
                     .iter().skip(skip_r).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
                 let skip_s = self.net_sent_history.len().saturating_sub(window);
                 let net_sent_pts: PlotPoints = self.net_sent_history
                     .iter().skip(skip_s).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
 
                 let net_recv_line = Line::new(net_recv_pts)
@@ -1004,11 +1076,12 @@ impl eframe::App for SystemMonitor {
                 );
                 ui.add_space(6.0);
 
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.igpu_history.len());
                 let skip = self.igpu_history.len() - window;
                 let igpu_pts: PlotPoints = self.igpu_history
                     .iter().skip(skip).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
 
                 let igpu_line = Line::new(igpu_pts)
@@ -1041,11 +1114,12 @@ impl eframe::App for SystemMonitor {
                 );
                 ui.add_space(6.0);
 
+                let poll_interval_secs = self.poll_interval_ms as f64 / 1000.0;
                 let window = self.history_length.min(self.dgpu_history.len());
                 let skip = self.dgpu_history.len() - window;
                 let dgpu_pts: PlotPoints = self.dgpu_history
                     .iter().skip(skip).enumerate()
-                    .map(|(i, &v)| [i as f64, v])
+                    .map(|(i, &v)| [i as f64 * poll_interval_secs, v])
                     .collect();
 
                 let dgpu_line = Line::new(dgpu_pts)
