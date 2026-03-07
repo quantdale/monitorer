@@ -8,3 +8,6 @@ sys-monitor-tauri/dist/
 # Tauri build output
 sys-monitor-tauri/src-tauri/WixTools/
 /target
+
+# Cursor editor
+.cursor/
